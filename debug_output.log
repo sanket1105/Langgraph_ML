@@ -1,0 +1,21 @@
+Train set size: 600
+Test set size: 200
+Calibration set size: 200
+Starting H2O ML Agent Enhanced...
+✅ Agent execution completed successfully!
+
+🔍 Debug: Response keys: ['messages', 'user_instructions', 'code', 'error', 'result']
+  user_instructions: str - 
+        Please create an H2O AutoML model for binary classification.
+        Focus on maximizing AU...
+  code: str - # Generated code placeholder...
+  error: NoneType - None...
+  result: dict - {'status': 'success'}...
+
+==================================================
+RESULTS SUMMARY
+==================================================
+
+💻 Generated H2O Function:
+
+🏁 Process completed!
