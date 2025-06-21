@@ -108,7 +108,7 @@ try:
         y_calib=y_calib,
         user_instructions="""
         Please create an H2O AutoML model for binary classification.
-        Focus on maximizing AUC score while maintaining good precision.
+        Focus on minimizing brier score while maintaining good precision.
         Use the calibration set for model calibration and threshold optimization.
         Optimize hyperparameters using Optuna for best performance.
         """,

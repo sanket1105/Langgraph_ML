@@ -4,6 +4,7 @@ def h2o_automl_enhanced(train_data, test_data, calib_data, target_variable, feat
     from h2o.automl import H2OAutoML
     import pandas as pd
     import numpy as np
+    import mapie
     from contextlib import nullcontext
     
     # Optional imports
@@ -37,7 +38,7 @@ def h2o_automl_enhanced(train_data, test_data, calib_data, target_variable, feat
 
         # Convert target variable to categorical if it's binary
         # Check if target has only 2 unique values by converting to pandas first
-        target_values = train_h2o[target_variable].as_data_frame().values.flatten()
+        target_values = train_h2o[target_variable].as_data_frame(use_multi_thread=True).values.flatten()
         if len(set(target_values)) == 2:
             train_h2o[target_variable] = train_h2o[target_variable].asfactor()
             test_h2o[target_variable] = test_h2o[target_variable].asfactor()
@@ -78,8 +79,8 @@ def h2o_automl_enhanced(train_data, test_data, calib_data, target_variable, feat
             if len(set(target_values)) == 2:  # Binary classification
                 # Get predicted probabilities
                 test_pred = aml.leader.predict(test_h2o)
-                test_probs = test_pred['p1'].as_data_frame().values.flatten()  # Probability of positive class
-                test_actual = test_h2o[target_variable].as_data_frame().values.flatten()
+                test_probs = test_pred['p1'].as_data_frame(use_multi_thread=True).values.flatten()  # Probability of positive class
+                test_actual = test_h2o[target_variable].as_data_frame(use_multi_thread=True).values.flatten()
                 
                 # Convert to numeric if categorical
                 if test_actual.dtype == 'object':
@@ -130,8 +131,8 @@ def h2o_automl_enhanced(train_data, test_data, calib_data, target_variable, feat
             if len(set(target_values)) == 2:  # Binary classification
                 # Get predicted probabilities
                 calib_pred = aml.leader.predict(calib_h2o)
-                calib_probs = calib_pred['p1'].as_data_frame().values.flatten()  # Probability of positive class
-                calib_actual = calib_h2o[target_variable].as_data_frame().values.flatten()
+                calib_probs = calib_pred['p1'].as_data_frame(use_multi_thread=True).values.flatten()  # Probability of positive class
+                calib_actual = calib_h2o[target_variable].as_data_frame(use_multi_thread=True).values.flatten()
                 
                 # Convert to numeric if categorical
                 if calib_actual.dtype == 'object':
@@ -165,13 +166,49 @@ def h2o_automl_enhanced(train_data, test_data, calib_data, target_variable, feat
             model_path = h2o.save_model(model=aml.leader, path=save_path, force=True)
 
         # Get leaderboard
-        leaderboard_df = aml.leaderboard.as_data_frame()
+        leaderboard_df = aml.leaderboard.as_data_frame(use_multi_thread=True)
+        # Compute Brier Score for all models in the leaderboard (binary classification only)
+        if len(set(target_values)) == 2:
+            brier_scores = []
+            for model_id in leaderboard_df['model_id']:
+                model = h2o.get_model(model_id)
+                pred = model.predict(test_h2o)
+                if 'p1' in pred.columns:
+                    probs = pred['p1'].as_data_frame(use_multi_thread=True).values.flatten()
+                else:
+                    # fallback to first probability column if p1 not present
+                    prob_cols = [col for col in pred.columns if col.startswith('p')]
+                    probs = pred[prob_cols[0]].as_data_frame(use_multi_thread=True).values.flatten()
+                actual = test_h2o[target_variable].as_data_frame(use_multi_thread=True).values.flatten()
+                if actual.dtype == 'object':
+                    actual = (actual == actual[0]).astype(int)
+                brier = np.mean((probs - actual) ** 2)
+                brier_scores.append(brier)
+            leaderboard_df['brier_score'] = brier_scores
+            leaderboard_df = leaderboard_df.sort_values('brier_score', ascending=True).reset_index(drop=True)
         leaderboard_dict = leaderboard_df.to_dict()
+
+        # Set best model as the one with the lowest Brier Score (if available)
+        if 'brier_score' in leaderboard_df.columns:
+            best_model_id = leaderboard_df.loc[0, 'model_id']
+            best_model = h2o.get_model(best_model_id)
+            if model_directory or log_path:
+                save_path = model_directory if model_directory else log_path
+                model_path = h2o.save_model(model=best_model, path=save_path, force=True)
+            else:
+                model_path = None
+        else:
+            best_model_id = aml.leader.model_id
+            model_path = model_path if 'model_path' in locals() else None
+
+        # Get model type and parameters
+        model_type = type(best_model).__name__
+        model_params = best_model.params if hasattr(best_model, "params") else {}
 
         # Prepare results
         results = {
             'leaderboard': leaderboard_dict,
-            'best_model_id': aml.leader.model_id,
+            'best_model_id': best_model_id,
             'model_path': model_path,
             'test_metrics': test_metrics,
             'calibration_metrics': calib_metrics,
@@ -179,10 +216,20 @@ def h2o_automl_enhanced(train_data, test_data, calib_data, target_variable, feat
             'model_results': {
                 'model_flavor': 'H2O AutoML Enhanced',
                 'model_path': model_path,
-                'best_model_id': aml.leader.model_id,
+                'best_model_id': best_model_id,
                 'test_performance': test_metrics,
                 'calibration_performance': calib_metrics
-            }
+            },
+            'model_type': model_type,
+            'model_parameters': model_params
         }
+
+        # Add CDF vs EDF PDF for all models
+        try:
+            cdf_edf_pdf_path = plot_cdf_vs_edf_for_models(leaderboard_df, test_h2o, target_variable, logs_dir=log_path or "logs/")
+            results['cdf_edf_pdf_path'] = cdf_edf_pdf_path
+        except Exception as e:
+            print(f"Could not generate CDF vs EDF PDF: {e}")
+            results['cdf_edf_pdf_path'] = None
 
         return results

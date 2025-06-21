@@ -1,12 +1,12 @@
-# BUSINESS SCIENCE UNIVERSITY
-# AI DATA SCIENCE TEAM
 # Enhanced H2O Machine Learning Agent with Train/Test/Calib Split and Optuna Optimization
 
 import json
 import operator
 import os
+import warnings
 from typing import Annotated, Any, Dict, Literal, Optional, Sequence, TypedDict
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from IPython.display import Markdown
@@ -14,6 +14,7 @@ from langchain.prompts import PromptTemplate
 from langchain_core.messages import AIMessage, BaseMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import Checkpointer, Command
+from matplotlib.backends.backend_pdf import PdfPages
 
 from ai_logging import log_ai_function
 from dataframe import get_dataframe_summary
@@ -34,6 +35,8 @@ from regex import (
     get_generic_summary,
     relocate_imports_inside_function,
 )
+
+warnings.filterwarnings("ignore")
 
 
 def fix_code_indentation(code: str) -> str:
@@ -266,6 +269,7 @@ def h2o_automl_enhanced(train_data, test_data, calib_data, target_variable, feat
     from h2o.automl import H2OAutoML
     import pandas as pd
     import numpy as np
+    import mapie
     from contextlib import nullcontext
     
     # Optional imports
@@ -299,7 +303,7 @@ def h2o_automl_enhanced(train_data, test_data, calib_data, target_variable, feat
 
         # Convert target variable to categorical if it's binary
         # Check if target has only 2 unique values by converting to pandas first
-        target_values = train_h2o[target_variable].as_data_frame().values.flatten()
+        target_values = train_h2o[target_variable].as_data_frame(use_multi_thread=True).values.flatten()
         if len(set(target_values)) == 2:
             train_h2o[target_variable] = train_h2o[target_variable].asfactor()
             test_h2o[target_variable] = test_h2o[target_variable].asfactor()
@@ -340,8 +344,8 @@ def h2o_automl_enhanced(train_data, test_data, calib_data, target_variable, feat
             if len(set(target_values)) == 2:  # Binary classification
                 # Get predicted probabilities
                 test_pred = aml.leader.predict(test_h2o)
-                test_probs = test_pred['p1'].as_data_frame().values.flatten()  # Probability of positive class
-                test_actual = test_h2o[target_variable].as_data_frame().values.flatten()
+                test_probs = test_pred['p1'].as_data_frame(use_multi_thread=True).values.flatten()  # Probability of positive class
+                test_actual = test_h2o[target_variable].as_data_frame(use_multi_thread=True).values.flatten()
                 
                 # Convert to numeric if categorical
                 if test_actual.dtype == 'object':
@@ -392,8 +396,8 @@ def h2o_automl_enhanced(train_data, test_data, calib_data, target_variable, feat
             if len(set(target_values)) == 2:  # Binary classification
                 # Get predicted probabilities
                 calib_pred = aml.leader.predict(calib_h2o)
-                calib_probs = calib_pred['p1'].as_data_frame().values.flatten()  # Probability of positive class
-                calib_actual = calib_h2o[target_variable].as_data_frame().values.flatten()
+                calib_probs = calib_pred['p1'].as_data_frame(use_multi_thread=True).values.flatten()  # Probability of positive class
+                calib_actual = calib_h2o[target_variable].as_data_frame(use_multi_thread=True).values.flatten()
                 
                 # Convert to numeric if categorical
                 if calib_actual.dtype == 'object':
@@ -427,13 +431,49 @@ def h2o_automl_enhanced(train_data, test_data, calib_data, target_variable, feat
             model_path = h2o.save_model(model=aml.leader, path=save_path, force=True)
 
         # Get leaderboard
-        leaderboard_df = aml.leaderboard.as_data_frame()
+        leaderboard_df = aml.leaderboard.as_data_frame(use_multi_thread=True)
+        # Compute Brier Score for all models in the leaderboard (binary classification only)
+        if len(set(target_values)) == 2:
+            brier_scores = []
+            for model_id in leaderboard_df['model_id']:
+                model = h2o.get_model(model_id)
+                pred = model.predict(test_h2o)
+                if 'p1' in pred.columns:
+                    probs = pred['p1'].as_data_frame(use_multi_thread=True).values.flatten()
+                else:
+                    # fallback to first probability column if p1 not present
+                    prob_cols = [col for col in pred.columns if col.startswith('p')]
+                    probs = pred[prob_cols[0]].as_data_frame(use_multi_thread=True).values.flatten()
+                actual = test_h2o[target_variable].as_data_frame(use_multi_thread=True).values.flatten()
+                if actual.dtype == 'object':
+                    actual = (actual == actual[0]).astype(int)
+                brier = np.mean((probs - actual) ** 2)
+                brier_scores.append(brier)
+            leaderboard_df['brier_score'] = brier_scores
+            leaderboard_df = leaderboard_df.sort_values('brier_score', ascending=True).reset_index(drop=True)
         leaderboard_dict = leaderboard_df.to_dict()
+
+        # Set best model as the one with the lowest Brier Score (if available)
+        if 'brier_score' in leaderboard_df.columns:
+            best_model_id = leaderboard_df.loc[0, 'model_id']
+            best_model = h2o.get_model(best_model_id)
+            if model_directory or log_path:
+                save_path = model_directory if model_directory else log_path
+                model_path = h2o.save_model(model=best_model, path=save_path, force=True)
+            else:
+                model_path = None
+        else:
+            best_model_id = aml.leader.model_id
+            model_path = model_path if 'model_path' in locals() else None
+
+        # Get model type and parameters
+        model_type = type(best_model).__name__
+        model_params = best_model.params if hasattr(best_model, "params") else {}
 
         # Prepare results
         results = {
             'leaderboard': leaderboard_dict,
-            'best_model_id': aml.leader.model_id,
+            'best_model_id': best_model_id,
             'model_path': model_path,
             'test_metrics': test_metrics,
             'calibration_metrics': calib_metrics,
@@ -441,11 +481,21 @@ def h2o_automl_enhanced(train_data, test_data, calib_data, target_variable, feat
             'model_results': {
                 'model_flavor': 'H2O AutoML Enhanced',
                 'model_path': model_path,
-                'best_model_id': aml.leader.model_id,
+                'best_model_id': best_model_id,
                 'test_performance': test_metrics,
                 'calibration_performance': calib_metrics
-            }
+            },
+            'model_type': model_type,
+            'model_parameters': model_params
         }
+
+        # Add CDF vs EDF PDF for all models
+        try:
+            cdf_edf_pdf_path = plot_cdf_vs_edf_for_models(leaderboard_df, test_h2o, target_variable, logs_dir=log_path or "logs/")
+            results['cdf_edf_pdf_path'] = cdf_edf_pdf_path
+        except Exception as e:
+            print(f"Could not generate CDF vs EDF PDF: {e}")
+            results['cdf_edf_pdf_path'] = None
 
         return results
 """
@@ -517,6 +567,16 @@ class H2OMLAgentEnhanced(BaseAgent):
         Retrieves test set performance metrics.
     get_calibration_metrics()
         Retrieves calibration set performance metrics.
+    get_model_type()
+        Retrieves the model type.
+    get_model_parameters()
+        Retrieves the model parameters.
+    empirical_cdf(self, data)
+        Compute the empirical CDF for a 1D array-like of data.
+    empirical_edf(self, data)
+        Alias for empirical CDF (EDF and CDF are the same for empirical data).
+    plot_cdf_vs_edf_for_leaderboard(self, leaderboard_df, test_h2o, target_variable, logs_dir="logs/")
+        Plot CDF vs EDF for each model in the leaderboard and save all plots to a single PDF.
 
     Examples
     --------
@@ -669,6 +729,32 @@ class H2OMLAgentEnhanced(BaseAgent):
 
         response = self._compiled_graph.invoke(initial_state, **kwargs)
         self.response = response
+
+        # Automatically generate CDF vs EDF PDF after training
+        leaderboard_df = self.get_leaderboard()
+        # Try to get test_h2o and target_variable from arguments or state
+        test_h2o = kwargs.get("test_h2o", None)
+        if test_h2o is None:
+            try:
+                import h2o
+
+                test_h2o = h2o.H2OFrame(pd.concat([X_test, y_test], axis=1))
+            except Exception as e:
+                print(f"Could not create H2OFrame for test set: {e}")
+                test_h2o = None
+        target_variable = y_train.name
+        if (
+            leaderboard_df is not None
+            and test_h2o is not None
+            and target_variable is not None
+        ):
+            pdf_path = self.plot_reliability_curves_for_leaderboard(
+                leaderboard_df,
+                test_h2o,
+                target_variable,
+                logs_dir=self._params.get("log_path", "logs/"),
+            )
+            print(f"Reliability curves saved to: {pdf_path}")
         return None
 
     def get_leaderboard(self):
@@ -715,6 +801,154 @@ class H2OMLAgentEnhanced(BaseAgent):
                 return Markdown(f"```python\n{code}\n```")
             return code
         return None
+
+    def get_model_type(self):
+        if self.response and "model_type" in self.response:
+            return self.response["model_type"]
+        return None
+
+    def get_model_parameters(self):
+        if self.response and "model_parameters" in self.response:
+            return self.response["model_parameters"]
+        return None
+
+    def empirical_cdf(self, data):
+        """Compute the empirical CDF for a 1D array-like of data."""
+        import numpy as np
+
+        data = np.sort(np.asarray(data))
+        n = data.size
+        y = np.arange(1, n + 1) / n
+        return data, y
+
+    def empirical_edf(self, data):
+        """Alias for empirical CDF (EDF and CDF are the same for empirical data)."""
+        return self.empirical_cdf(data)
+
+    def plot_cdf_vs_edf_for_leaderboard(
+        self, leaderboard_df, test_h2o, target_variable, logs_dir="logs/"
+    ):
+        """
+        Plot CDF vs EDF for each model in the leaderboard and save all plots to a single PDF.
+        Returns the path to the PDF file.
+        """
+        import h2o
+
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir)
+        pdf_path = os.path.join(logs_dir, "cdf_vs_edf_leaderboard.pdf")
+        with PdfPages(pdf_path) as pdf:
+            for idx, model_id in enumerate(leaderboard_df["model_id"]):
+                try:
+                    model = h2o.get_model(model_id)
+                    pred = model.predict(test_h2o)
+                    if "p1" in pred.columns:
+                        probs = (
+                            pred["p1"]
+                            .as_data_frame(use_multi_thread=True)
+                            .values.flatten()
+                        )
+                    else:
+                        prob_cols = [col for col in pred.columns if col.startswith("p")]
+                        probs = (
+                            pred[prob_cols[0]]
+                            .as_data_frame(use_multi_thread=True)
+                            .values.flatten()
+                        )
+                    actual = (
+                        test_h2o[target_variable]
+                        .as_data_frame(use_multi_thread=True)
+                        .values.flatten()
+                    )
+                    # Convert to numeric if categorical
+                    if hasattr(actual, "dtype") and actual.dtype == "object":
+                        actual = (actual == actual[0]).astype(int)
+                    else:
+                        actual = actual.astype(int)
+                    # Empirical Distribution Function (EDF)
+                    sorted_probs = np.sort(probs)
+                    edf = np.arange(1, len(sorted_probs) + 1) / len(sorted_probs)
+                    # Cumulative Distribution Function (CDF) of actuals (for positive class)
+                    sorted_actual = np.sort(actual)
+                    cdf = np.arange(1, len(sorted_actual) + 1) / len(sorted_actual)
+                    # Plot
+                    plt.figure(figsize=(7, 5))
+                    plt.plot(
+                        sorted_probs,
+                        edf,
+                        label="EDF (Predicted Probabilities)",
+                        color="blue",
+                    )
+                    plt.plot(
+                        sorted_actual,
+                        cdf,
+                        label="CDF (Actual Outcomes)",
+                        color="orange",
+                    )
+                    plt.title(f"CDF vs EDF for Model: {model_id}")
+                    plt.xlabel("Probability / Outcome")
+                    plt.ylabel("Cumulative Fraction")
+                    plt.legend()
+                    plt.grid(True)
+                    pdf.savefig()
+                    plt.close()
+                except Exception as e:
+                    print(f"Could not plot CDF vs EDF for model {model_id}: {e}")
+        return pdf_path
+
+    def plot_reliability_curves_for_leaderboard(
+        self, leaderboard_df, test_h2o, target_variable, logs_dir="logs/"
+    ):
+        import os
+
+        import h2o
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from sklearn.calibration import calibration_curve
+
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir)
+        pdf_path = os.path.join(logs_dir, "reliability_curves_leaderboard.pdf")
+        plt.figure(figsize=(15, 5))
+        for idx, model_id in enumerate(
+            leaderboard_df["model_id"][:3]
+        ):  # Plot for top 3 models
+            model = h2o.get_model(model_id)
+            pred = model.predict(test_h2o)
+            if "p1" in pred.columns:
+                probs = pred["p1"].as_data_frame(use_multi_thread=True).values.flatten()
+            else:
+                prob_cols = [col for col in pred.columns if col.startswith("p")]
+                probs = (
+                    pred[prob_cols[0]]
+                    .as_data_frame(use_multi_thread=True)
+                    .values.flatten()
+                )
+            actual = (
+                test_h2o[target_variable]
+                .as_data_frame(use_multi_thread=True)
+                .values.flatten()
+            )
+            # Convert to numeric if categorical
+            if hasattr(actual, "dtype") and actual.dtype == "object":
+                actual = (actual == actual[0]).astype(int)
+            else:
+                actual = actual.astype(int)
+            prob_true, prob_pred = calibration_curve(actual, probs, n_bins=10)
+            plt.subplot(1, 3, idx + 1)
+            plt.plot(prob_pred, prob_true, marker="o", label="Test")
+            plt.plot([0, 1], [0, 1], "r--", label="Perfectly Calibrated")
+            plt.xlabel("Mean Predicted Probability")
+            plt.ylabel("Fraction of Positives")
+            plt.title(model_id[:30])
+            plt.ylim([0, 1])
+            plt.xlim([0, 1])
+            plt.legend()
+        plt.suptitle("Reliability Curves (Calibration) for Top 3 Models")
+        plt.tight_layout()
+        plt.savefig(pdf_path)
+        plt.close()
+        return pdf_path
 
 
 def make_h2o_ml_agent_enhanced(
@@ -984,7 +1218,7 @@ def make_h2o_ml_agent_enhanced(
 
                     # Convert target variable to categorical if it's binary
                     # Check if target has only 2 unique values by converting to pandas first
-                    target_values = train_h2o[target_variable].as_data_frame().values.flatten()
+                    target_values = train_h2o[target_variable].as_data_frame(use_multi_thread=True).values.flatten()
                     if len(set(target_values)) == 2:
                         train_h2o[target_variable] = train_h2o[target_variable].asfactor()
                         test_h2o[target_variable] = test_h2o[target_variable].asfactor()
@@ -1075,8 +1309,8 @@ def make_h2o_ml_agent_enhanced(
                         if len(set(target_values)) == 2:  # Binary classification
                             # Get predicted probabilities
                             test_pred = aml.leader.predict(test_h2o)
-                            test_probs = test_pred['p1'].as_data_frame().values.flatten()  # Probability of positive class
-                            test_actual = test_h2o[target_variable].as_data_frame().values.flatten()
+                            test_probs = test_pred['p1'].as_data_frame(use_multi_thread=True).values.flatten()  # Probability of positive class
+                            test_actual = test_h2o[target_variable].as_data_frame(use_multi_thread=True).values.flatten()
                             
                             # Convert to numeric if categorical
                             if test_actual.dtype == 'object':
@@ -1127,8 +1361,8 @@ def make_h2o_ml_agent_enhanced(
                         if len(set(target_values)) == 2:  # Binary classification
                             # Get predicted probabilities
                             calib_pred = aml.leader.predict(calib_h2o)
-                            calib_probs = calib_pred['p1'].as_data_frame().values.flatten()  # Probability of positive class
-                            calib_actual = calib_h2o[target_variable].as_data_frame().values.flatten()
+                            calib_probs = calib_pred['p1'].as_data_frame(use_multi_thread=True).values.flatten()  # Probability of positive class
+                            calib_actual = calib_h2o[target_variable].as_data_frame(use_multi_thread=True).values.flatten()
                             
                             # Convert to numeric if categorical
                             if calib_actual.dtype == 'object':
@@ -1162,8 +1396,40 @@ def make_h2o_ml_agent_enhanced(
                         model_path = h2o.save_model(model=aml.leader, path=save_path, force=True)
 
                     # Get leaderboard
-                    leaderboard_df = aml.leaderboard.as_data_frame()
+                    leaderboard_df = aml.leaderboard.as_data_frame(use_multi_thread=True)
+                    # Compute Brier Score for all models in the leaderboard (binary classification only)
+                    if len(set(target_values)) == 2:
+                        brier_scores = []
+                        for model_id in leaderboard_df['model_id']:
+                            model = h2o.get_model(model_id)
+                            pred = model.predict(test_h2o)
+                            if 'p1' in pred.columns:
+                                probs = pred['p1'].as_data_frame(use_multi_thread=True).values.flatten()
+                            else:
+                                # fallback to first probability column if p1 not present
+                                prob_cols = [col for col in pred.columns if col.startswith('p')]
+                                probs = pred[prob_cols[0]].as_data_frame(use_multi_thread=True).values.flatten()
+                            actual = test_h2o[target_variable].as_data_frame(use_multi_thread=True).values.flatten()
+                            if actual.dtype == 'object':
+                                actual = (actual == actual[0]).astype(int)
+                            brier = np.mean((probs - actual) ** 2)
+                            brier_scores.append(brier)
+                        leaderboard_df['brier_score'] = brier_scores
+                        leaderboard_df = leaderboard_df.sort_values('brier_score', ascending=True).reset_index(drop=True)
                     leaderboard_dict = leaderboard_df.to_dict()
+
+                    # Set best model as the one with the lowest Brier Score (if available)
+                    if 'brier_score' in leaderboard_df.columns:
+                        best_model_id = leaderboard_df.loc[0, 'model_id']
+                        best_model = h2o.get_model(best_model_id)
+                        if model_directory or log_path:
+                            save_path = model_directory if model_directory else log_path
+                            model_path = h2o.save_model(model=best_model, path=save_path, force=True)
+                        else:
+                            model_path = None
+                    else:
+                        best_model_id = aml.leader.model_id
+                        model_path = model_path if 'model_path' in locals() else None
 
                     # Log to MLflow if enabled
                     if enable_mlflow and run:
@@ -1177,7 +1443,7 @@ def make_h2o_ml_agent_enhanced(
                     # Prepare results
                     results = {{
                         'leaderboard': leaderboard_dict,
-                        'best_model_id': aml.leader.model_id,
+                        'best_model_id': best_model_id,
                         'model_path': model_path,
                         'test_metrics': test_metrics,
                         'calibration_metrics': calib_metrics,
@@ -1185,10 +1451,12 @@ def make_h2o_ml_agent_enhanced(
                         'model_results': {{
                             'model_flavor': 'H2O AutoML Enhanced',
                             'model_path': model_path,
-                            'best_model_id': aml.leader.model_id,
+                            'best_model_id': best_model_id,
                             'test_performance': test_metrics,
                             'calibration_performance': calib_metrics
-                        }}
+                        }},
+                        'model_type': model_type,
+                        'model_parameters': model_params
                     }}
 
                     return results
