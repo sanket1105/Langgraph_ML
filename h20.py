@@ -950,6 +950,253 @@ class H2OMLAgentEnhanced(BaseAgent):
         plt.close()
         return pdf_path
 
+    def train_and_compare_all_models(
+        self,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        X_test,
+        y_test,
+        h2o_leaderboard_df,
+        test_h2o,
+        target_variable,
+        logs_dir="logs/",
+    ):
+        """
+        Trains and Optuna-tunes XGBoost, CatBoost, LightGBM, RandomForest, Logistic Regression (L1 & L2),
+        merges their results with the H2O leaderboard, and plots reliability curves for all models.
+        Returns the unified leaderboard and PDF path.
+        """
+        import os
+
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import optuna
+        import pandas as pd
+        from catboost import CatBoostClassifier
+        from lightgbm import LGBMClassifier
+        from sklearn.calibration import calibration_curve
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+        from xgboost import XGBClassifier
+
+        if not os.path.exists(logs_dir):
+            os.makedirs(logs_dir)
+
+        custom_models = {}
+        custom_results = []
+
+        # Helper for Optuna tuning
+        def tune_model(objective, n_trials=30, timeout=300):
+            study = optuna.create_study(direction="maximize")
+            study.optimize(objective, n_trials=n_trials, timeout=timeout)
+            return study.best_trial.params
+
+        # Random Forest
+        def rf_objective(trial):
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "max_depth": trial.suggest_int("max_depth", 2, 20),
+                "min_samples_split": trial.suggest_int("min_samples_split", 2, 10),
+            }
+            clf = RandomForestClassifier(**params, random_state=42)
+            clf.fit(X_train, y_train)
+            probas = clf.predict_proba(X_val)[:, 1]
+            return roc_auc_score(y_val, probas)
+
+        rf_params = tune_model(rf_objective)
+        rf = RandomForestClassifier(**rf_params, random_state=42)
+        rf.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
+        custom_models["Random Forest"] = rf
+
+        # XGBoost
+        def xgb_objective(trial):
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "max_depth": trial.suggest_int("max_depth", 2, 20),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "use_label_encoder": False,
+                "eval_metric": "logloss",
+            }
+            clf = XGBClassifier(**params, random_state=42)
+            clf.fit(X_train, y_train)
+            probas = clf.predict_proba(X_val)[:, 1]
+            return roc_auc_score(y_val, probas)
+
+        xgb_params = tune_model(xgb_objective)
+        xgb = XGBClassifier(**xgb_params, random_state=42)
+        xgb.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
+        custom_models["XGBoost"] = xgb
+
+        # CatBoost
+        def cat_objective(trial):
+            params = {
+                "iterations": trial.suggest_int("iterations", 50, 300),
+                "depth": trial.suggest_int("depth", 2, 10),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+                "verbose": 0,
+            }
+            clf = CatBoostClassifier(**params, random_state=42)
+            clf.fit(X_train, y_train)
+            probas = clf.predict_proba(X_val)[:, 1]
+            return roc_auc_score(y_val, probas)
+
+        cat_params = tune_model(cat_objective)
+        cat = CatBoostClassifier(**cat_params, random_state=42, verbose=0)
+        cat.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
+        custom_models["CatBoost"] = cat
+
+        # LightGBM
+        def lgbm_objective(trial):
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 50, 300),
+                "max_depth": trial.suggest_int("max_depth", 2, 20),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            }
+            clf = LGBMClassifier(**params, random_state=42)
+            clf.fit(X_train, y_train)
+            probas = clf.predict_proba(X_val)[:, 1]
+            return roc_auc_score(y_val, probas)
+
+        lgbm_params = tune_model(lgbm_objective)
+        lgbm = LGBMClassifier(**lgbm_params, random_state=42)
+        lgbm.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
+        custom_models["LightGBM"] = lgbm
+
+        # Logistic Regression L1
+        def lr_l1_objective(trial):
+            params = {
+                "C": trial.suggest_float("C", 0.01, 10.0, log=True),
+                "penalty": "l1",
+                "solver": "liblinear",
+            }
+            clf = LogisticRegression(**params, random_state=42, max_iter=1000)
+            clf.fit(X_train, y_train)
+            probas = clf.predict_proba(X_val)[:, 1]
+            return roc_auc_score(y_val, probas)
+
+        lr_l1_params = tune_model(lr_l1_objective)
+        lr_l1 = LogisticRegression(**lr_l1_params, random_state=42, max_iter=1000)
+        lr_l1.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
+        custom_models["Logistic Regression (L1)"] = lr_l1
+
+        # Logistic Regression L2
+        def lr_l2_objective(trial):
+            params = {
+                "C": trial.suggest_float("C", 0.01, 10.0, log=True),
+                "penalty": "l2",
+                "solver": "liblinear",
+            }
+            clf = LogisticRegression(**params, random_state=42, max_iter=1000)
+            clf.fit(X_train, y_train)
+            probas = clf.predict_proba(X_val)[:, 1]
+            return roc_auc_score(y_val, probas)
+
+        lr_l2_params = tune_model(lr_l2_objective)
+        lr_l2 = LogisticRegression(**lr_l2_params, random_state=42, max_iter=1000)
+        lr_l2.fit(pd.concat([X_train, X_val]), pd.concat([y_train, y_val]))
+        custom_models["Logistic Regression (L2)"] = lr_l2
+
+        # Collect results for custom models
+        for name, model in custom_models.items():
+            probas = model.predict_proba(X_test)[:, 1]
+            auc = roc_auc_score(y_test, probas)
+            brier = brier_score_loss(y_test, probas)
+            logloss = log_loss(y_test, probas)
+            custom_results.append(
+                {
+                    "model_id": name,
+                    "auc": auc,
+                    "brier_score": brier,
+                    "logloss": logloss,
+                    "probas": probas,
+                }
+            )
+
+        # Prepare unified leaderboard
+        leaderboard = h2o_leaderboard_df.copy()
+        leaderboard = (
+            leaderboard[["model_id", "auc", "brier_score", "logloss"]]
+            if "logloss" in leaderboard.columns
+            else leaderboard[["model_id", "auc", "brier_score"]]
+        )
+        for res in custom_results:
+            leaderboard = pd.concat(
+                [
+                    leaderboard,
+                    pd.DataFrame(
+                        [
+                            {k: res.get(k, np.nan) for k in leaderboard.columns}
+                            | {"model_id": res["model_id"]}
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
+
+        # Plot reliability curves for all models
+        n_models = len(custom_results) + len(h2o_leaderboard_df)
+        n_cols = 3
+        n_rows = (n_models + n_cols - 1) // n_cols
+        plt.figure(figsize=(5 * n_cols, 5 * n_rows))
+        # H2O models
+        for idx, model_id in enumerate(h2o_leaderboard_df["model_id"]):
+            model = h2o.get_model(model_id)
+            pred = model.predict(test_h2o)
+            if "p1" in pred.columns:
+                probs = pred["p1"].as_data_frame(use_multi_thread=True).values.flatten()
+            else:
+                prob_cols = [col for col in pred.columns if col.startswith("p")]
+                probs = (
+                    pred[prob_cols[0]]
+                    .as_data_frame(use_multi_thread=True)
+                    .values.flatten()
+                )
+            actual = (
+                test_h2o[target_variable]
+                .as_data_frame(use_multi_thread=True)
+                .values.flatten()
+            )
+            if hasattr(actual, "dtype") and actual.dtype == "object":
+                actual = (actual == actual[0]).astype(int)
+            else:
+                actual = actual.astype(int)
+            prob_true, prob_pred = calibration_curve(actual, probs, n_bins=10)
+            plt.subplot(n_rows, n_cols, idx + 1)
+            plt.plot(prob_pred, prob_true, marker="o", label="Test")
+            plt.plot([0, 1], [0, 1], "r--", label="Perfectly Calibrated")
+            plt.xlabel("Mean Predicted Probability")
+            plt.ylabel("Fraction of Positives")
+            plt.title(model_id[:30])
+            plt.ylim([0, 1])
+            plt.xlim([0, 1])
+            plt.legend()
+        # Custom models
+        for j, res in enumerate(custom_results):
+            probas = res["probas"]
+            prob_true, prob_pred = calibration_curve(y_test, probas, n_bins=10)
+            plt.subplot(n_rows, n_cols, len(h2o_leaderboard_df) + j + 1)
+            plt.plot(prob_pred, prob_true, marker="o", label="Test")
+            plt.plot([0, 1], [0, 1], "r--", label="Perfectly Calibrated")
+            plt.xlabel("Mean Predicted Probability")
+            plt.ylabel("Fraction of Positives")
+            plt.title(res["model_id"])
+            plt.ylim([0, 1])
+            plt.xlim([0, 1])
+            plt.legend()
+        plt.suptitle("Reliability Curves (Calibration) for All Models")
+        plt.tight_layout()
+        pdf_path = os.path.join(logs_dir, "reliability_curves_all_models.pdf")
+        plt.savefig(pdf_path)
+        plt.close()
+        return leaderboard, pdf_path
+
 
 def make_h2o_ml_agent_enhanced(
     model,
