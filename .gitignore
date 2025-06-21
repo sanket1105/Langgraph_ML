@@ -1,0 +1,46 @@
+# Ignore logs and outputs
+logs/
+*.log
+*.pdf
+
+# Ignore model files
+*.h5
+*.hdf5
+*.pkl
+*.joblib
+*.sav
+*.model
+
+# Ignore Optuna study files
+*.db
+*.sqlite
+
+# Ignore Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+
+# Ignore data files
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.npy
+*.npz
+
+# Ignore environment files
+.env
+.venv/
+venv/
+
+# Ignore system files
+.DS_Store
+
+.gitignore
+h20.py
+graph.py
+h2o_doc.py
+test_logs/
+
