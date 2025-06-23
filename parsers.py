@@ -1,6 +1,3 @@
-# BUSINESS SCIENCE UNIVERSITY
-# AI DATA SCIENCE TEAM
-# ***
 # Parsers
 
 import re
